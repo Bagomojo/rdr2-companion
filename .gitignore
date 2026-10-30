@@ -1,0 +1,19 @@
+# Build output
+mod/bin/
+mod/obj/
+*.user
+.vs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local state and secrets
+.env
+*.key
+bridge/state/
+bridge/logs/
+
+# Release builds
+dist/
