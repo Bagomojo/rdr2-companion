@@ -6,7 +6,7 @@ The results go into the snapshot as `bridge_flags`. The model treats them as fac
 import personas
 
 EARSHOT_M = 30
-# Nearby things that can't overhear Kit.
+# Nearby things that can't overhear the companion.
 NOT_PEOPLE = ("horse", "animal", "dog", "wolf", "deer", "bear", "cougar", "bird", "cow", "light")
 CALM_EVENTS = {"camp_set_up", "campfire", "heartbeat", "hotkey"}
 

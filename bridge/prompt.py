@@ -11,9 +11,9 @@ RULES = HERE / "prompts" / "rules.md"
 
 
 def _persona_text() -> str:
-    text = (HERE / "persona" / personas.current()["file"]).read_text(encoding="utf-8")
-    # An "Open for Dave" section holds editing notes, not character: drop just that section.
-    return re.sub(r"## Open for Dave.*?(?=\n## |\Z)", "", text, flags=re.S).rstrip()
+    text = (personas.current()["dir"] / "persona.md").read_text(encoding="utf-8")
+    # A "Notes" section holds editing notes, not character: drop just that section.
+    return re.sub(r"## Notes\b.*?(?=\n## |\Z)", "", text, flags=re.S).rstrip()
 
 
 def system_blocks() -> list[dict]:

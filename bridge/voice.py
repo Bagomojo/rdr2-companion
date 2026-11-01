@@ -1,7 +1,7 @@
-"""Speaks Kit's lines through the PC's speakers with his ElevenLabs voice.
+"""Speaks the companion's lines through the PC's speakers with his ElevenLabs voice.
 
 Each line is generated as 16-bit PCM, wrapped in a WAV header, scaled for how far
-Kit is from the player, and played with winsound, so there are no extra packages.
+he is from the player, and played with winsound, so there are no extra packages.
 Lines are cached by text and delivery, so repeats cost nothing. Any failure just
 leaves the line as a subtitle.
 """
@@ -19,22 +19,28 @@ import winsound
 from array import array
 from pathlib import Path
 
-# Any voice in your ElevenLabs library: a cloned one, or one from their Voice Library.
-VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID") or os.environ.get("KIT_VOICE_ID", "")
+import personas
+
+# Any voice in your ElevenLabs library: a cloned one, or one from their Voice Library. The
+# companion's own voice_id wins over the one in .env.
+VOICE_ID = personas.current()["voice_id"] or os.environ.get("ELEVENLABS_VOICE_ID") or os.environ.get("KIT_VOICE_ID", "")
 # Most expressive model first (Flash sounded flat in testing); about 0.5 s slower per line.
 # If the service rejects a model, fall back to the next one.
 MODELS = ["eleven_v3", "eleven_multilingual_v2"]
 SAMPLE_RATE = 22050
-# Kit played far louder than the game's own voices at 1.0. Override with KIT_VOICE_VOLUME.
-VOLUME = float(os.environ.get("KIT_VOICE_VOLUME", "0.4"))
+# The companion played far louder than the game's own voices at 1.0. Override with voice_volume in the
+# companion's companion.ini, or COMPANION_VOICE_VOLUME for all of them (KIT_VOICE_VOLUME in v0.1).
+VOLUME = float(personas.current()["voice_volume"] or os.environ.get("COMPANION_VOICE_VOLUME")
+               or os.environ.get("KIT_VOICE_VOLUME", "0.4"))
 SILENT_BEYOND_M = 40
 FULL_VOLUME_WITHIN_M = 8
 
 # "period": careful 1899 speech around strangers. "own": his real, quicker 2015 voice.
-# eleven_v3 takes stability 0.0, 0.5 or 1.0 only; 0.5 is its natural setting.
+# eleven_v3 takes stability 0.0, 0.5 or 1.0 only; 0.5 is its natural setting, and in his own
+# voice it came out deadpan, so that one is on 0.0 ("creative"), the most expressive.
 DELIVERY = {
     "period": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.3, "speed": 0.93},
-    "own": {"stability": 0.5, "similarity_boost": 0.8, "style": 0.45, "speed": 1.0},
+    "own": {"stability": 0.0, "similarity_boost": 0.8, "style": 0.6, "speed": 1.0},
     # Loosest stability v3 takes, slower, and a [drunk] cue in front of the line.
     "drunk": {"stability": 0.0, "similarity_boost": 0.8, "style": 0.6, "speed": 0.9},
 }
@@ -69,7 +75,7 @@ def _scaled(pcm: bytes, gain: float) -> bytes:
 class Voice:
     def __init__(self, key: str):
         if not VOICE_ID:
-            raise RuntimeError("no ELEVENLABS_VOICE_ID in bridge\\.env")
+            raise RuntimeError("no voice_id in companion.ini or ELEVENLABS_VOICE_ID in bridge\\.env")
         self.key = key
         self.model_index = 0
         self.lines: queue.Queue = queue.Queue(maxsize=2)
@@ -94,6 +100,9 @@ class Voice:
                 winsound.PlaySound(_wav(_scaled(pcm, gain)), winsound.SND_MEMORY | winsound.SND_NODEFAULT)
             except Exception as e:  # a voice failure must never take the bridge down
                 print(f"voice: {type(e).__name__}: {e}", flush=True)
+                if "quota_exceeded" in str(e):
+                    print("  Your ElevenLabs character credits have run out; he'll use subtitles until they"
+                          " renew or you top up.", flush=True)
 
     def _pcm(self, text: str, delivery: str) -> bytes:
         settings = json.dumps(DELIVERY[delivery], sort_keys=True)

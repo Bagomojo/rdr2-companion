@@ -7,6 +7,8 @@ Usage: .venv\\Scripts\\python.exe server.py [mix|haiku|opus]   (default: mix)
 """
 
 import json
+import os
+import random
 import re
 import sys
 import threading
@@ -14,6 +16,32 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+class _Tee:
+    """Started by hand, the bridge prints to its window; keep a copy in logs/console.txt as well,
+    so there's always a log to attach to a bug report. (Started by the mod, it's already there.)"""
+
+    def __init__(self, stream, copy):
+        self.stream, self.copy = stream, copy
+
+    def write(self, text):
+        self.stream.write(text)
+        self.copy.write(text)
+        self.copy.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+
+if sys.stdout.isatty():
+    (Path(__file__).parent / "logs").mkdir(exist_ok=True)
+    _console = open(Path(__file__).parent / "logs" / "console.txt", "w", encoding="utf-8")
+    sys.stdout, sys.stderr = _Tee(sys.stdout, _console), _Tee(sys.stderr, _console)
+
+from version import VERSION
+
+print(f"Companion bridge v{VERSION}, {datetime.now():%Y-%m-%d %H:%M}", flush=True)
 
 import anthropic
 
@@ -42,6 +70,7 @@ DEFAULT_STATE = {
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "mix"
 last_comment_at = float("-inf")
+warned_profile = False  # told the player once that the mod asked for another companion
 greeted = False  # has this bridge run already said hello? A fresh bridge means a fresh session.
 said_lately: list[str] = []  # survives re-summons, unlike the mod's recent_lines
 print("Reading the API keys...", flush=True)
@@ -79,7 +108,7 @@ def apply(state: dict, d: dict) -> dict:
 
 AUDIO_TAGS = {"laughs", "chuckles", "laughs harder", "starts laughing", "wheezing", "sighs",
               "exhales", "snorts", "sarcastic", "excited", "tired", "groans", "gasps",
-              "mischievously", "hiccups", "burps", "drunk"}
+              "mischievously", "hiccups", "burps", "drunk", "curious", "annoyed", "happy"}
 TAG = re.compile(r"\[([a-z ]{2,24})\]")
 
 
@@ -89,6 +118,37 @@ def keep_known_tags(line: str) -> str:
 
 def strip_tags(line: str) -> str:
     return re.sub(r"\s{2,}", " ", TAG.sub("", line)).strip()
+
+
+# Left alone, every line came out as one of his two classics. They stay as two kinds among many:
+# the bridge picks what kind of line he says this turn, weighted, never the same kind as the last two.
+LINE_STYLES = {
+    "quote": (3, "a movie quote that fits, said straight: no setup, no movie name"),
+    "plain": (3, "a dry comment in his own words, no movie and no fact"),
+    "modern": (2, "a comparison to something specific from modern life"),
+    "roast": (2, "ribbing Arthur about what he's doing right now"),
+    "short": (2, "a tiny reaction, three to six words"),
+    "wright": (2, "a new deadpan, surreal one-liner in the style of Steven Wright, about something here"),
+    "fact": (1, "one useless, true, oddly specific fact, no movie"),
+    "body": (1, "a complaint about his own body or comfort"),
+    "question": (1, "a short absurd question, no movie"),
+    "misquote": (1, "a famous quote mangled, or credited to the wrong movie"),
+    "callback": (1, "a callback to something in his journal"),
+    "classic": (3, 'his classic bit: an observation, then "Very <movie title>.", then a quote from that movie'),
+    "classic_fact": (2, "his other classic: an observation, then a random fact, then an unrelated movie quote"),
+}
+STYLE_EXEMPT = {"campfire", "reunion", "hotkey"}
+recent_styles: list[str] = []
+
+
+def pick_line_style(state: dict) -> str:
+    names = [n for n in LINE_STYLES if n not in recent_styles[-2:]]
+    if not state.get("journal"):
+        names = [n for n in names if n != "callback"]
+    style = random.choices(names, weights=[LINE_STYLES[n][0] for n in names])[0]
+    recent_styles.append(style)
+    del recent_styles[:-4]
+    return style
 
 
 def _ngrams(text: str, n: int = 4) -> set:
@@ -140,6 +200,7 @@ class Handler(BaseHTTPRequestHandler):
         snapshot = body["snapshot"]
         global last_comment_at
         global greeted
+        global warned_profile
         if snapshot.get("event") == "summoned" and state.get("sessions") and (not greeted or is_new_session()):
             # First summon after a break: a reunion, with what he remembers of last time.
             snapshot = {**snapshot, "event": "reunion",
@@ -154,6 +215,15 @@ class Handler(BaseHTTPRequestHandler):
         # The mod forgets its lines when he's re-summoned; the bridge doesn't.
         lines = snapshot.get("recent_lines") or []
         snapshot = {**snapshot, "recent_lines": (said_lately + [l for l in lines if l not in said_lately])[-12:]}
+        if snapshot.get("profile") and snapshot["profile"] != personas.NAME and not warned_profile:
+            warned_profile = True
+            print(f"The mod wants companion '{snapshot['profile']}' but this bridge is playing "
+                  f"'{personas.NAME}'. Restart the bridge (or the game) to switch.", flush=True)
+        # The joke kinds are a comedy companion's; a straight one writes in his own voice.
+        if personas.current()["comedy"] and snapshot.get("event") not in STYLE_EXEMPT:
+            style = pick_line_style(state)
+            snapshot = {**snapshot, "line_style": LINE_STYLES[style][1],
+                        "address_arthur": random.random() < 0.33}
         # A story takes Opus a few seconds longer to write than a one-liner, and is long enough to
         # share four words with something by chance, so it skips the repeat guard (and its retry,
         # which would outlast the mod's 20 s wait).
@@ -192,6 +262,13 @@ class Handler(BaseHTTPRequestHandler):
             "error": result.error,
             "problems": result.problems,
         })
+        if result.error:
+            print(f"Claude call failed: {result.error[:300]}", flush=True)
+            if "credit balance" in result.error:
+                print("  Your Anthropic account is out of API credit. Add some at console.anthropic.com under"
+                      " Billing; a Claude.ai Pro or Max subscription doesn't cover the API.", flush=True)
+            elif "AuthenticationError" in result.error:
+                print("  Check ANTHROPIC_API_KEY in bridge\\.env.", flush=True)
         self._reply(result.decision)
 
     def _reply(self, decision: dict) -> None:
@@ -206,7 +283,21 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def quit_with_game(pid: int) -> None:
+    """Background, when the mod started us: wait for the game to close, then stop too."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE: enough to wait on it
+    if not handle:
+        return
+    kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+    print("The game closed, so the bridge is stopping too.", flush=True)
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    if os.environ.get("RDR2_GAME_PID", "").isdigit():
+        threading.Thread(target=quit_with_game, args=(int(os.environ["RDR2_GAME_PID"]),), daemon=True).start()
     try:
         n = memory.catch_up(client, load_state, save_state, include_open=True)
         if n:

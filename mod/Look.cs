@@ -1,5 +1,5 @@
 // The companion's appearance on the game's character-creator body (mp_male), and the
-// in-game editor used to tune it. Every choice is an index, saved to KitLook.ini by label,
+// in-game editor used to tune it. Every choice is an index, saved to looks\<companion>.ini by label,
 // so the editor and the saved file stay in step even if part lists change.
 
 using System;
@@ -10,7 +10,7 @@ using System.Text.RegularExpressions;
 using RDR2;
 using RDR2.Native;
 
-namespace KitCompanion
+namespace DaveCompanion
 {
     internal class Look
     {
@@ -137,17 +137,21 @@ namespace KitCompanion
             return map.Where(kv => kv.Key.StartsWith(style + "|")).Select(kv => kv.Value).FirstOrDefault();
         }
 
+        // Head and body pieces the last Apply put on, so a caller can check they really landed.
+        public readonly List<uint> Applied = new List<uint>();
+
         public void Apply(Ped ped)
         {
+            Applied.Clear();
             int skin = V("Skin tone") + 1;
             PED._EQUIP_META_PED_OUTFIT_PRESET(ped.Handle, 3, true);
             PED._EQUIP_META_PED_OUTFIT(ped.Handle, (uint)BodyTypes[V("Body type")]);
             PED._EQUIP_META_PED_OUTFIT(ped.Handle, (uint)Waists[V("Waist")]);
 
             int body = bodyNums[V("Body")];
-            if (bodiesUpper.TryGetValue((body, skin), out var bu)) Wear(ped, bu);
-            if (bodiesLower.TryGetValue((body, skin), out var bl)) Wear(ped, bl);
-            if (heads.TryGetValue((headNums[V("Head")], skin), out var head)) Wear(ped, head);
+            if (bodiesUpper.TryGetValue((body, skin), out var bu)) { Wear(ped, bu); Applied.Add(bu); }
+            if (bodiesLower.TryGetValue((body, skin), out var bl)) { Wear(ped, bl); Applied.Add(bl); }
+            if (heads.TryGetValue((headNums[V("Head")], skin), out var head)) { Wear(ped, head); Applied.Add(head); }
             Wear(ped, LookParts.Eyes[V("Eyes")].Hash);
 
             uint hairHash = StyleColorHash(hair, hairStyles[V("Hair style")], hairColors[V("Hair color")]);
@@ -185,8 +189,11 @@ namespace KitCompanion
         // ---------- saving ----------
 
         public void Save(string path)
-            => File.WriteAllLines(path, new[] { "; Kit's look, written by the in-game look editor." }
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.WriteAllLines(path, new[] { "; Companion look, written by the in-game look editor." }
                 .Concat(Parts.Select(p => p.Label + "=" + p.Value)));
+        }
 
         public void Load(string path)
         {

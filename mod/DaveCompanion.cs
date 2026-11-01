@@ -6,9 +6,11 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -18,9 +20,9 @@ using RDR2.Math;
 using RDR2.Native;
 using Screen = RDR2.UI.Screen;
 
-namespace KitCompanion
+namespace DaveCompanion
 {
-    public partial class Kit : Script
+    public partial class Companion : Script
     {
         const string BridgeUrl = "http://127.0.0.1:7777/decide";
         const int HeartbeatSeconds = 20;
@@ -28,6 +30,9 @@ namespace KitCompanion
         const float CatchUpMeters = 150f;
         const float OffScreenCatchUpMeters = 45f;
         const float FarBehindMeters = 15f;
+        const float WalkToHorseMeters = 20f;   // closer than this, he goes to his horse instead of whistling
+        const float HorseWhistleMeters = 100f; // your whistle brings his horse too, from this close
+        const int HorseWaitSeconds = 10;       // a whistled horse that hasn't come by then is brought up off screen
 
         static readonly HttpClient Http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };  // campfire stories take Opus up to 15 s
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
@@ -35,7 +40,7 @@ namespace KitCompanion
         readonly List<string> recentEvents = new List<string>();
         readonly List<string> recentLines = new List<string>();
 
-        Keys keySummon = Keys.NumPad1, keyThink = Keys.NumPad2, keyWait = Keys.NumPad3, keyFollow = Keys.NumPad4, keyScout = Keys.NumPad5, keyEditor = Keys.End;
+        Keys keySummon = Keys.NumPad1, keyThink = Keys.NumPad2, keyWait = Keys.NumPad3, keyFollow = Keys.NumPad4, keyScout = Keys.NumPad5, keyClose = Keys.NumPad6, keyAmbush = Keys.NumPad7, keyEditor = Keys.End;
 
         // Once a look has been saved, the companion is built on the character-creator body.
         uint KitModel => lookEnabled ? (uint)PedHash.mp_male : (uint)PedHash.a_m_m_strtownfolk_01;
@@ -44,8 +49,12 @@ namespace KitCompanion
         string lookIni;
         bool lookEnabled, editing, openEditorAfterSpawn;
         int editPart;
-        // Shown on his subtitles and notices; set with Name= in KitCompanion.ini.
-        string name = "Kit";
+        // Which companion: a folder in the bridge's companions folder, and looks\<id>.ini here.
+        // Set with Companion= in DaveCompanion.ini.
+        string companionId = "dave";
+        // Shown on his subtitles and notices: Name= in DaveCompanion.ini, else the companion's own
+        // companion.ini in the bridge folder, else the id.
+        string name = "";
         const int SpawnTimeoutSeconds = 10;
 
         // Key presses are only recorded here; all game calls happen on the tick,
@@ -57,7 +66,7 @@ namespace KitCompanion
         DateTime spawnStarted, refreshLooksAt = DateTime.MaxValue;
         string currentAction = "follow";
         string pendingHotkey;
-        bool followFar, followInside;
+        bool followFar, followInside, followLagging, sideBySide;
         DateTime lastSent = DateTime.MinValue, lastFollowCheck = DateTime.MinValue, subtitleUntil = DateTime.MinValue;
         string subtitle = "";
         bool lastPlayerInCombat, lastPlayerMounted, lastMission;
@@ -65,19 +74,27 @@ namespace KitCompanion
         const int DownSeconds = 8;
         DateTime downAt = DateTime.MaxValue;
         string nextSpawnEvent = "summoned";
+        // A hello the bridge missed because it was still starting (reading keys can take a minute),
+        // sent again every few seconds until it answers.
+        string retryEvent;
+        DateTime retryUntil;
+        bool toldBridgeDown;
+        const int BridgeRetrySeconds = 5, BridgeRetryForSeconds = 180;
         bool holdingBack, followMounted, followFast;
 
-        public Kit()
+        public Companion()
         {
             LoadKeys();
-            lookIni = Path.Combine(BaseDirectory, "KitLook.ini");
+            if (name.Length == 0) name = CompanionName();
+            StartBridge();
+            lookIni = LookPath();
             lookEnabled = File.Exists(lookIni);
             try { look.Load(lookIni); } catch (Exception ex) { Log("look: " + ex.Message); }
             Tick += OnTick;
             KeyDown += OnKeyDown;
             Aborted += (s, e) => Despawn();
             Interval = 0;
-            Log("loaded");
+            Log($"loaded v{GetType().Assembly.GetName().Version.ToString(3)}, companion {companionId}, bridge {(bridgeDir.Length > 0 ? "starts with the game" : "started by hand")}");
         }
 
         // ---------- input ----------
@@ -89,6 +106,8 @@ namespace KitCompanion
             else if (e.KeyCode == keyWait) keyQueue.Enqueue("wait_here");
             else if (e.KeyCode == keyFollow) keyQueue.Enqueue("follow_me");
             else if (e.KeyCode == keyScout) keyQueue.Enqueue("scout_ahead");
+            else if (e.KeyCode == keyClose) keyQueue.Enqueue("side_by_side");
+            else if (e.KeyCode == keyAmbush) keyQueue.Enqueue("ambush");
             else if (e.KeyCode == keyEditor) keyQueue.Enqueue("editor");
             else if (editing)
             {
@@ -111,6 +130,15 @@ namespace KitCompanion
                     else { summoned = true; BeginSpawn(); }
                 }
                 else if (key == "editor") ToggleEditor();
+                else if (key == "ambush") StartAmbush();
+                else if (key == "side_by_side")
+                {
+                    // For filming two-shots: he rides and walks right beside the player.
+                    sideBySide = !sideBySide;
+                    Log("side by side " + (sideBySide ? "on" : "off"));
+                    Notice(sideBySide ? name + " sticks right beside you." : name + " gives you some room.");
+                    if (summoned && Alive(kit) && currentAction == "follow") { holdingBack = false; ApplyAction("follow"); }
+                }
                 else if (key.StartsWith("ed_")) EditorKey(key);
                 else if (summoned && Alive(kit) && !editing) Hotkey(key);
             }
@@ -131,11 +159,12 @@ namespace KitCompanion
         {
             HandleKeys();
             DrainDecisions();
+            UpdateAmbush();
             if (DateTime.Now < subtitleUntil) Screen.DisplaySubtitle(subtitle);
 
             if (!summoned) return;
             if (spawning) { SpawnStep(); return; }
-            if (DateTime.Now >= refreshLooksAt) { refreshLooksAt = DateTime.MaxValue; RefreshLooks(); }
+            if (DateTime.Now >= refreshLooksAt) { refreshLooksAt = DateTime.MaxValue; CheckLooks(); }
             Ped player = Game.Player.Character;
 
             bool mission = Game.IsMissionActive;
@@ -156,9 +185,15 @@ namespace KitCompanion
             if (openEditorAfterSpawn) { openEditorAfterSpawn = false; StartEditing(); }
             if (editing) { EditorTick(); return; }
 
+            if (PlayerWhistled()) CallHorseToo();
             string trigger = DetectEvent(player);
             if (trigger == null && pendingEvent != null && !requestInFlight) { trigger = pendingEvent; pendingEvent = null; }
             if (pendingHotkey != null && !requestInFlight) trigger = "hotkey";
+            else if (trigger == null && retryEvent != null && (DateTime.Now - lastSent).TotalSeconds >= BridgeRetrySeconds)
+            {
+                if (DateTime.Now < retryUntil) trigger = retryEvent;
+                else retryEvent = null;
+            }
             else if (trigger == null && (DateTime.Now - lastSent).TotalSeconds >= HeartbeatSeconds) trigger = "heartbeat";
             if (trigger != null && !requestInFlight) Send(trigger, player);
 
@@ -167,7 +202,7 @@ namespace KitCompanion
                 lastFollowCheck = DateTime.Now;
                 UpdateActivities(player);
                 // Fighting, fishing and scouting each steer him themselves.
-                if (!combatActive && !fishing && !atFire && !Scouting) KeepFollowing(player);
+                if (!combatActive && !fishing && !atFire && !atBar && !Scouting) KeepFollowing(player);
             }
         }
 
@@ -215,7 +250,7 @@ namespace KitCompanion
                 spawning = false;
                 summoned = false;
                 Log("spawn failed: models did not load within " + SpawnTimeoutSeconds + "s");
-                Notice(name + " couldn't be spawned. See KitCompanion.log.");
+                Notice(name + " couldn't be spawned. See DaveCompanion.log.");
             }
         }
 
@@ -242,6 +277,7 @@ namespace KitCompanion
                 else PED._SET_RANDOM_OUTFIT_VARIATION(kit.Handle, true);
                 look.ApplyHorse(roach);
                 RefreshLooks();
+                lookTries = 0;
                 refreshLooksAt = DateTime.Now.AddSeconds(1.5);
                 SetUpKit();
 
@@ -260,7 +296,7 @@ namespace KitCompanion
                 // No game calls here: if the script is being aborted, they would throw again.
                 Log("spawn failed: " + ex);
                 summoned = false;
-                Notice(name + " couldn't be spawned. See KitCompanion.log.");
+                Notice(name + " couldn't be spawned. See DaveCompanion.log.");
             }
         }
 
@@ -327,6 +363,31 @@ namespace KitCompanion
                 if (lookEnabled) look.Apply(kit);
                 else PED._UPDATE_PED_VARIATION(kit.Handle, false, true, true, true, false);
             }
+        }
+
+        // In Valentine a freshly saved look (new head and skin tone) hadn't streamed in by the one
+        // re-apply at 1.5 s, and he talked from an invisible body. Keep re-applying until the game
+        // says he's ready to render and his head and body are really on him.
+        int lookTries;
+        const int MaxLookTries = 10;
+
+        void CheckLooks()
+        {
+            if (kit == null || !kit.Exists()) return;
+            if (!lookEnabled) { RefreshLooks(); return; }
+            // The first check always re-applies: the pass at spawn usually lands before streaming.
+            bool ready = lookTries > 0 && PED.IS_PED_READY_TO_RENDER(kit.Handle)
+                && look.Applied.All(h => PED._IS_METAPED_USING_COMPONENT(kit.Handle, h));
+            if (ready) { if (lookTries > 1) Log("look: ready after " + lookTries + " tries"); return; }
+            if (lookTries >= MaxLookTries)
+            {
+                Log($"look: gave up after {lookTries} tries (ready to render={PED.IS_PED_READY_TO_RENDER(kit.Handle)}, "
+                    + $"{look.Applied.Count(h => PED._IS_METAPED_USING_COMPONENT(kit.Handle, h))} of {look.Applied.Count} head/body pieces on)");
+                return;
+            }
+            RefreshLooks();
+            lookTries++;
+            refreshLooksAt = DateTime.Now.AddSeconds(1.5);
         }
 
         // ---------- look editor ----------
@@ -402,6 +463,22 @@ namespace KitCompanion
                 $"[Up/Down part, Left/Right change, Shift jumps 10, {keyEditor} saves]");
         }
 
+        // The game's whistle, on foot or riding.
+        static bool PlayerWhistled()
+            => Function.Call<bool>(0x91AEF906BCA88877, 0, 0x24978A28u)   // IS_CONTROL_JUST_PRESSED, INPUT_WHISTLE
+            || Function.Call<bool>(0x91AEF906BCA88877, 0, 0xE7EB9185u);  // INPUT_WHISTLE_HORSEBACK
+
+        // When you whistle for your horse, his comes too if it's in earshot and he's on foot.
+        void CallHorseToo()
+        {
+            if (kit.IsOnMount || roach == null || !roach.Exists() || roach.IsDead) return;
+            float toRoach = roach.Position.DistanceTo(kit.Position);
+            if (toRoach < 6f || toRoach > HorseWhistleMeters) return;
+            roach.Task.GoToWhistle(kit);
+            lastWhistle = DateTime.Now;
+            Log($"you whistled: his horse comes too ({toRoach:0} m)");
+        }
+
         void Notice(string text)
         {
             // Shown by the tick, like Kit's own lines.
@@ -413,6 +490,7 @@ namespace KitCompanion
         {
             try
             {
+                DropBottle();
                 if (Alive(kit) || (kit != null && kit.Exists())) kit.Delete();
                 if (roach != null && roach.Exists()) roach.Delete();
             }
@@ -445,17 +523,30 @@ namespace KitCompanion
                     roach.Position = kit.Position - kit.ForwardVector * 3f;
                     toRoach = 3f;
                 }
-                if (toRoach > 6f)
+                if (toRoach > WalkToHorseMeters)
                 {
-                    if ((DateTime.Now - lastWhistle).TotalSeconds > 8)
+                    double since = (DateTime.Now - lastWhistle).TotalSeconds;
+                    if (since > HorseWaitSeconds)
                     {
+                        if (since < HorseWaitSeconds + 5 && !roach.IsOnScreen)
+                        {
+                            // Whistled and still not here (stuck on a fence, or lost): bring him up unseen, close
+                            // enough that he walks over to him.
+                            roach.Position = kit.Position - player.ForwardVector * 15f;  // behind, out of the camera's view
+                            Log("horse: didn't come, brought up behind him");
+                        }
                         roach.Task.GoToWhistle(kit);
                         lastWhistle = DateTime.Now;
                     }
                     if (dist > FollowRepathMeters) ApplyAction("follow");
                     return;
                 }
-                kit.Task.MountAnimal(roach, -1, (eVehicleSeat)(-1), 2f, (eEnterExitVehicleFlags)0);
+                // Close enough: he goes to his horse and climbs on rather than chasing you on foot.
+                if ((DateTime.Now - lastMountOrder).TotalSeconds > 2)
+                {
+                    kit.Task.MountAnimal(roach, -1, (eVehicleSeat)(-1), 2f, (eEnterExitVehicleFlags)0);
+                    lastMountOrder = DateTime.Now;
+                }
                 return;
             }
             if (!player.IsOnMount && kit.IsOnMount)
@@ -467,34 +558,86 @@ namespace KitCompanion
             // they walk into him, he steps aside. Never while riding (on a road that made him peel
             // away every time he caught up) and never indoors (it parked him in the doorway).
             bool inside = INTERIOR.GET_INTERIOR_FROM_ENTITY(player.Handle) != 0;
-            if (!player.IsOnMount && !kit.IsOnMount && !inside)
+            if (!player.IsOnMount && !kit.IsOnMount && !inside && !sideBySide)
             {
                 Vector3 toKit = kit.Position - player.Position;
                 float ahead = toKit.X * player.ForwardVector.X + toKit.Y * player.ForwardVector.Y;
                 float side = toKit.X * player.RightVector.X + toKit.Y * player.RightVector.Y;
-                bool crowding = dist < 2.5f && player.Speed > 0.5f;
-                if ((ahead > 1f && dist < 6f) || crowding)
+                // Only when he's really in their way: in front and in line, with the player walking.
+                // (Any time the player turned round he used to count as "in front" and shuffle off.)
+                bool inPath = ahead > 0.5f && Math.Abs(side) < 1.2f && dist < 4f && player.Speed > 0.5f;
+                bool crowding = dist < 1.2f && player.Speed > 0.5f;
+                if (inPath || crowding)
                 {
                     if (!holdingBack)
                     {
+                        // His side first, the other side if someone's standing there, else straight back.
                         float away = side >= 0 ? 1f : -1f;
-                        Vector3 clear = kit.Position + player.RightVector * (away * 3f) - player.ForwardVector * 1.5f;
-                        kit.Task.ClearTasks(false);
-                        kit.Task.GoTo(clear, 1f, 4000);
-                        holdingBack = true;
-                        Log("stepped aside");
+                        Vector3 back = -player.ForwardVector * 1.5f;
+                        Vector3 clear = kit.Position + player.RightVector * (away * 3f) + back;
+                        if (!SpotClear(clear)) clear = kit.Position - player.RightVector * (away * 3f) + back;
+                        if (!SpotClear(clear)) clear = kit.Position - player.ForwardVector * 2.5f;
+                        StepTo(clear, "stepped aside");
                     }
                     return;
+                }
+                if (DateTime.Now < stepUntil) return;
+                // Townsfolk get the same courtesy. He used to stand his ground, and in Strawberry a
+                // laborer who kept walking into him picked a fight over it.
+                if (!holdingBack && (DateTime.Now - lastMakeWay).TotalSeconds > 1)
+                {
+                    lastMakeWay = DateTime.Now;
+                    Ped walker = World.GetAllPeds().FirstOrDefault(p => p != null && p.Exists() && p.IsHuman && !p.IsDead
+                        && p.Handle != player.Handle && p.Handle != kit.Handle && p.Speed > 0.5f
+                        && p.Position.DistanceTo(kit.Position) < 1.6f
+                        && Vector3.Dot(p.ForwardVector, kit.Position - p.Position) > 0f);
+                    if (walker != null)
+                    {
+                        // Off their line, to whichever side of it he's already on.
+                        Vector3 across = walker.RightVector;
+                        float onSide = Vector3.Dot(kit.Position - walker.Position, across) >= 0 ? 1f : -1f;
+                        Vector3 clear = kit.Position + across * (onSide * 1.8f);
+                        if (!SpotClear(clear)) clear = kit.Position - walker.ForwardVector * 2f;
+                        StepTo(clear, "made way for someone");
+                        return;
+                    }
                 }
             }
             bool fast = player.IsOnMount ? player.CurrentMount != null && player.CurrentMount.Speed > 6f : player.IsRunning || player.IsSprinting;
             bool far = dist > FarBehindMeters;
+            // Side by side: a follow task always trails a little, so when he drops more than a
+            // couple of meters back he goes one gait faster until he's level again.
+            bool lagging = false;
+            if (sideBySide && player.Speed > 0.5f)
+            {
+                Vector3 rel = kit.Position - player.Position;
+                float level = rel.X * player.ForwardVector.X + rel.Y * player.ForwardVector.Y;
+                lagging = followLagging ? level < -0.5f : level < -2f;
+            }
             if (holdingBack || dist > FollowRepathMeters || player.IsOnMount != followMounted || fast != followFast
-                || far != followFar || inside != followInside)
+                || far != followFar || inside != followInside || lagging != followLagging)
             {
                 holdingBack = false;
                 ApplyAction("follow");
             }
+        }
+
+        DateTime lastMakeWay = DateTime.MinValue, stepUntil = DateTime.MinValue;
+
+        // Nobody but him (the player included) within a metre of the spot.
+        bool SpotClear(Vector3 at)
+        {
+            return !World.GetAllPeds().Any(p => p != null && p.Exists() && p.IsHuman && !p.IsDead
+                && p.Handle != kit.Handle && p.Position.DistanceTo(at) < 1.2f);
+        }
+
+        void StepTo(Vector3 at, string why)
+        {
+            kit.Task.ClearTasks(false);
+            kit.Task.GoTo(at, 1f, 4000);
+            holdingBack = true;
+            stepUntil = DateTime.Now.AddSeconds(1.5);
+            Log(why);
         }
 
         void ApplyAction(string action, string target = "")
@@ -518,14 +661,27 @@ namespace KitCompanion
                         ? player.CurrentMount != null && player.CurrentMount.Speed > 6f
                         : player.IsRunning || player.IsSprinting;
                     followFar = kit.Position.DistanceTo(player.Position) > FarBehindMeters;
+                    if (!sideBySide) followLagging = false;
+                    else if (player.Speed > 0.5f)
+                    {
+                        Vector3 rel = kit.Position - player.Position;
+                        float level = rel.X * player.ForwardVector.X + rel.Y * player.ForwardVector.Y;
+                        followLagging = followLagging ? level < -0.5f : level < -2f;
+                    }
                     followInside = INTERIOR.GET_INTERIOR_FROM_ENTITY(player.Handle) != 0;
-                    // Indoors a spot 4.5 m back can be outside the door, so he stays at the player's shoulder.
-                    Vector3 offset = followMounted ? new Vector3(-2f, -9f, 0f)
-                        : followInside ? new Vector3(-0.8f, -1.5f, 0f) : new Vector3(-1.5f, -4.5f, 0f);
+                    // Indoors a spot further back can be outside the door, so he stays at the player's shoulder.
+                    // By default beside and a step back on the left, where he's in shot and not underfoot;
+                    // level with the player in side-by-side, with room between the horses so he doesn't drift in.
+                    Vector3 offset = sideBySide
+                        ? (followMounted ? new Vector3(-3f, 0.5f, 0f) : new Vector3(-1.5f, 0.3f, 0f))
+                        : followMounted ? new Vector3(-2.2f, -3.5f, 0f)
+                        : followInside ? new Vector3(-0.9f, -1f, 0f) : new Vector3(-1.6f, -1.2f, 0f);
                     // 3 is a gallop or sprint: needed to keep up with a fast horse or close a gap.
                     float pace = followFast || followFar ? (followMounted || followFar ? 3f : 2f) : 1f;
+                    if (followLagging) pace = Math.Min(3f, pace + 1f);
+                    if (sideBySide) Log($"side by side: pace {pace}{(followLagging ? ", catching up" : "")}");
                     TASK.TASK_FOLLOW_TO_OFFSET_OF_ENTITY(kit.Handle, player.Handle, offset,
-                        pace, -1, 1.5f, true, false, false, false, false, false);
+                        pace, -1, sideBySide ? 0.8f : 1.5f, true, false, false, false, false, false);
                     currentAction = "follow";
                     if (action != "follow" && action != "idle") Log("action '" + action + "' not wired yet, following instead");
                     break;
@@ -549,8 +705,24 @@ namespace KitCompanion
                     var resp = await Http.PostAsync(BridgeUrl, new StringContent(body, Encoding.UTF8, "application/json"));
                     string text = await resp.Content.ReadAsStringAsync();
                     decisions.Enqueue(json.Deserialize<Dictionary<string, object>>(text));
+                    if (evt == retryEvent) { Log("bridge: up, " + evt + " delivered"); retryEvent = null; }
                 }
-                catch (Exception ex) { Log("bridge unreachable: " + ex.GetBaseException().Message); }
+                catch (Exception ex)
+                {
+                    if (retryEvent == null) Log("bridge unreachable: " + ex.GetBaseException().Message);
+                    if (evt == "summoned" || evt == "companion_recovered")
+                    {
+                        if (retryEvent == null) retryUntil = DateTime.Now.AddSeconds(BridgeRetryForSeconds);
+                        retryEvent = evt;
+                    }
+                    if (!toldBridgeDown)
+                    {
+                        toldBridgeDown = true;
+                        Notice(bridgeDir.Length > 0
+                            ? name + " is still waking up (the bridge is starting). Give him a minute."
+                            : name + " can't talk: the bridge isn't running. Start start-bridge.cmd.");
+                    }
+                }
                 finally { requestInFlight = false; }
             });
         }
@@ -616,9 +788,10 @@ namespace KitCompanion
                         { "weapon_drawn", Game.Player.IsAiming || player.IsShooting },
                         { "cash", Game.Player.Money < 1000 ? "little" : Game.Player.Money < 10000 ? "some" : "plenty" },
                         { "waypoint", null },
-                        { "activity", fishing ? "fishing" : combatActive ? "fighting" : atFire ? "at_campfire" : "" },
+                        { "activity", fishing ? "fishing" : combatActive ? "fighting" : atFire ? "at_campfire" : atBar ? "at_bar" : "" },
                         { "drunk", DrunkBracket(playerDrunk) },
                     } },
+                { "profile", companionId },
                 { "companion", new Dictionary<string, object>
                     {
                         { "health", Bracket(kit.Health, kit.MaxHealth) },
@@ -655,10 +828,12 @@ namespace KitCompanion
 
         void LoadKeys()
         {
-            // Optional KitCompanion.ini next to the dll, lines like "Summon=NumPad1".
+            // Optional DaveCompanion.ini next to the dll, lines like "Summon=NumPad1". An install
+            // from before the rename still has KitCompanion.ini, so that's read when it's the only one.
             try
             {
-                string ini = Path.Combine(BaseDirectory, "KitCompanion.ini");
+                string ini = Path.Combine(BaseDirectory, "DaveCompanion.ini");
+                if (!File.Exists(ini)) ini = Path.Combine(BaseDirectory, "KitCompanion.ini");
                 if (!File.Exists(ini)) return;
                 foreach (var line in File.ReadAllLines(ini))
                 {
@@ -666,6 +841,16 @@ namespace KitCompanion
                     if (parts.Length == 2 && parts[0].Trim().Equals("Name", StringComparison.OrdinalIgnoreCase))
                     {
                         if (parts[1].Trim().Length > 0) name = parts[1].Trim();
+                        continue;
+                    }
+                    if (parts.Length == 2 && parts[0].Trim().Equals("Companion", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (parts[1].Trim().Length > 0) companionId = parts[1].Trim().ToLowerInvariant();
+                        continue;
+                    }
+                    if (parts.Length == 2 && parts[0].Trim().Equals("Bridge", StringComparison.OrdinalIgnoreCase))
+                    {
+                        bridgeDir = parts[1].Trim();
                         continue;
                     }
                     if (parts.Length != 2 || !Enum.TryParse(parts[1].Trim(), true, out Keys k)) continue;
@@ -676,6 +861,8 @@ namespace KitCompanion
                         case "waithere": keyWait = k; break;
                         case "followme": keyFollow = k; break;
                         case "scoutahead": keyScout = k; break;
+                        case "sidebyside": keyClose = k; break;
+                        case "ambush": keyAmbush = k; break;
                         case "lookeditor": keyEditor = k; break;
                     }
                 }
@@ -683,9 +870,70 @@ namespace KitCompanion
             catch (Exception ex) { Log("ini: " + ex.Message); }
         }
 
+        // looks\<companion>.ini, written by the look editor. A Dave install from before companions
+        // had one look in KitLook.ini; it's used until the editor saves his own file.
+        string LookPath()
+        {
+            string own = Path.Combine(BaseDirectory, "looks", companionId + ".ini");
+            string old = Path.Combine(BaseDirectory, "KitLook.ini");
+            return !File.Exists(own) && companionId == "dave" && File.Exists(old) ? old : own;
+        }
+
+        // name = in the companion's companion.ini, when the bridge folder is known.
+        string CompanionName()
+        {
+            try
+            {
+                string ini = Path.Combine(bridgeDir, "companions", companionId, "companion.ini");
+                if (bridgeDir.Length > 0 && File.Exists(ini))
+                    foreach (var line in File.ReadAllLines(ini))
+                    {
+                        var parts = line.Split(new[] { '=' }, 2);
+                        if (parts.Length == 2 && parts[0].Trim().Equals("name", StringComparison.OrdinalIgnoreCase)
+                            && parts[1].Trim().Length > 0)
+                            return parts[1].Split(';')[0].Trim();
+                    }
+            }
+            catch (Exception ex) { Log("companion.ini: " + ex.Message); }
+            return companionId.Length > 0 ? char.ToUpperInvariant(companionId[0]) + companionId.Substring(1) : "Dave";
+        }
+
+        // Bridge= in DaveCompanion.ini: the bridge folder. When it's set, the bridge starts with the
+        // game (hidden, its output in logs\console.txt) and quits when the game does.
+        string bridgeDir = "";
+
+        void StartBridge()
+        {
+            if (bridgeDir.Length == 0) return;
+            string cmd = Path.Combine(bridgeDir, "start-bridge.cmd");
+            if (!File.Exists(cmd)) { Log("bridge: no start-bridge.cmd in " + bridgeDir); return; }
+            try
+            {
+                using (var probe = new TcpClient())
+                    if (probe.ConnectAsync("127.0.0.1", 7777).Wait(300)) { Log("bridge: already running"); return; }
+            }
+            catch { }  // refused: nothing listening yet
+            try
+            {
+                string logs = Path.Combine(bridgeDir, "logs");
+                Directory.CreateDirectory(logs);
+                var info = new ProcessStartInfo("cmd.exe", $"/c \"\"{cmd}\" > \"{Path.Combine(logs, "console.txt")}\" 2>&1\"")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = bridgeDir,
+                };
+                info.EnvironmentVariables["RDR2_GAME_PID"] = Process.GetCurrentProcess().Id.ToString();
+                info.EnvironmentVariables["RDR2_COMPANION"] = companionId;
+                Process.Start(info);
+                Log("bridge: started");
+            }
+            catch (Exception ex) { Log("bridge: couldn't start: " + ex.Message); }
+        }
+
         void Log(string msg)
         {
-            try { File.AppendAllText(Path.Combine(BaseDirectory, "KitCompanion.log"), $"[{DateTime.Now:HH:mm:ss}] {msg}\r\n"); }
+            try { File.AppendAllText(Path.Combine(BaseDirectory, "DaveCompanion.log"), $"[{DateTime.Now:HH:mm:ss}] {msg}\r\n"); }
             catch { }
         }
     }

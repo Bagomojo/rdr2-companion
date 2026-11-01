@@ -9,9 +9,9 @@ using RDR2;
 using RDR2.Math;
 using RDR2.Native;
 
-namespace KitCompanion
+namespace DaveCompanion
 {
-    public partial class Kit
+    public partial class Companion
     {
         const float CombatRangeMeters = 70f;
         const int PeopleCommentSeconds = 75;
@@ -41,6 +41,7 @@ namespace KitCompanion
         bool castLine;
         DateTime fishingSince;
         DateTime lastWhistle = DateTime.MinValue;
+        DateTime lastMountOrder = DateTime.MinValue;
 
         void ArmKit()
         {
@@ -58,8 +59,9 @@ namespace KitCompanion
             UpdateCombat(player);
             if (!combatActive) UpdateFishing(player);
             if (!combatActive && !fishing) UpdateCampfire(player);
+            if (!combatActive && !fishing && !atFire) UpdateBar(player);
             UpdateDrinking(player);
-            if (!combatActive && !atFire) UpdatePeople(player);
+            if (!combatActive && !atFire && !atBar) UpdatePeople(player);
         }
 
         // ---------- gunfights ----------
@@ -76,8 +78,23 @@ namespace KitCompanion
                 .ToList();
         }
 
+        // The carbine for anything past 20 m, the revolver once they're within 12 m.
+        bool longGun;
+        bool playerFired, backingOff;  // playerFired: shots have been fired (by either side), so he may shoot back
+        DateTime lastBackOff = DateTime.MinValue, lastPlayerShot = DateTime.MinValue;
+
+        void PickGun(float nearest)
+        {
+            bool want = longGun ? nearest > 12f : nearest > 20f;
+            if (want == longGun) return;
+            longGun = want;
+            kit.Weapons.Select(longGun ? Repeater : Revolver, true);
+        }
+
         void UpdateCombat(Ped player)
         {
+            // Watched every tick: the shot that starts a fight lands before the game calls it one.
+            if (PED.IS_PED_SHOOTING(player.Handle)) lastPlayerShot = DateTime.Now;
             if (!player.IsInCombat)
             {
                 if (combatActive)
@@ -93,15 +110,65 @@ namespace KitCompanion
             {
                 // React at once with the default stance; Claude's call arrives a second later.
                 combatActive = true;
+                playerFired = false;
                 stance = "guard";
                 stanceApplied = false;
                 fishing = false;
                 scoutUntil = DateTime.MinValue;
-                kit.Weapons.Select(Revolver, true);
+                longGun = false;
+                AddEvent("the companion holds his fire until shots are fired");
             }
 
             var hostiles = Hostiles(player);
             if (hostiles.Count == 0) return;
+
+            // He never fires first. In Strawberry a laborer he'd bumped took a swing, and he shot
+            // back, which turned a shove into a town-wide gunfight. Until shots are fired (by the
+            // player, in the fight or just before it, or by anyone against them) he keeps his gun
+            // holstered and backs off from anyone in his face. Fists alone never draw it.
+            if (!playerFired)
+            {
+                Ped shooter = hostiles.FirstOrDefault(h => PED.IS_PED_SHOOTING(h.Handle));
+                if (shooter == null && (DateTime.Now - lastPlayerShot).TotalSeconds > 5)
+                {
+                    Ped close = hostiles[0];
+                    if (close.Position.DistanceTo(kit.Position) < 3f && (DateTime.Now - lastBackOff).TotalSeconds > 4)
+                    {
+                        kit.Task.ClearTasks(false);
+                        TASK.TASK_SMART_FLEE_PED(kit.Handle, close.Handle, 10f, 4000, 0, 3f, 0);
+                        lastBackOff = DateTime.Now;
+                        backingOff = true;
+                        Log("backed off from a fight he won't start");
+                    }
+                    else if (backingOff && (DateTime.Now - lastBackOff).TotalSeconds > 4)
+                    {
+                        // Back to the player's side. ApplyAction won't follow mid-fight, so step out of it for the call.
+                        backingOff = false;
+                        combatActive = false;
+                        ApplyAction("follow");
+                        combatActive = true;
+                    }
+                    return;
+                }
+                backingOff = false;
+                playerFired = true;
+                kit.Weapons.Select(Revolver, true);
+                if (shooter != null)
+                {
+                    // Whoever is shooting at them is the first one he answers.
+                    combatTarget = shooter;
+                    TASK.TASK_COMBAT_PED(kit.Handle, shooter.Handle, 0, 16);
+                    AddEvent("someone opened fire on them, and the companion drew his gun");
+                    Log("someone shot at them: joining the fight");
+                }
+                else
+                {
+                    combatTarget = null;
+                    AddEvent("the player opened fire, and the companion drew his gun");
+                    Log("player fired: joining the fight");
+                }
+            }
+            PickGun(hostiles[0].Position.DistanceTo(kit.Position));
 
             switch (stance)
             {
@@ -115,6 +182,7 @@ namespace KitCompanion
                     {
                         combatTarget = hostiles[0];
                         TASK.TASK_COMBAT_PED(kit.Handle, combatTarget.Handle, 0, 16);
+                        Log($"fighting someone {combatTarget.Position.DistanceTo(kit.Position):0} m away with the {(longGun ? "carbine" : "revolver")}");
                     }
                     break;
                 case "stay_out":
@@ -207,7 +275,8 @@ namespace KitCompanion
             {
                 if (sitting != lastSitting) LogFireCheck(player, sitting);
                 lastSitting = sitting;
-                if (!sitting) return;
+                // Indoors the "fire" is a lamp or a stove, and the scenario is the bar or a chair.
+                if (!sitting || PlayerInside(player)) return;
                 Vector3 fire;
                 bool found;
                 unsafe { found = FIRE.GET_CLOSEST_FIRE_POS(&fire, player.Position); }
@@ -281,7 +350,7 @@ namespace KitCompanion
         {
             if ((DateTime.Now - lastDrunkCheck).TotalSeconds < 2) return;
             lastDrunkCheck = DateTime.Now;
-            playerDrunk = PED._GET_PED_DRUNKNESS(player.Handle);
+            playerDrunk = PlayerDrunkness(player);
             if (playerDrunk > 0.1f && Math.Abs(playerDrunk - kitDrunk) > 0.05f)
             {
                 if (kitDrunk <= 0.1f) AddEvent("the player started drinking, and the companion is matching them drink for drink");
@@ -298,6 +367,150 @@ namespace KitCompanion
 
         bool lastSitting;
 
+        static bool PlayerInside(Ped player) => INTERIOR.GET_INTERIOR_FROM_ENTITY(player.Handle) != 0;
+
+        // ---------- at the bar ----------
+        // Indoors, when the player steps up to the bar (or sits at a table), he takes the nearest
+        // free spot of the same kind beside them, which brings the game's own drinking idles.
+        bool atBar, barSettled;
+        DateTime barSince, playerLeftBarAt;
+
+        void UpdateBar(Ped player)
+        {
+            bool leaning = PlayerInside(player) && PED.IS_PED_USING_ANY_SCENARIO(player.Handle) && !player.IsOnMount;
+            if (!atBar)
+            {
+                if (!leaning) return;
+                atBar = true;
+                barSettled = false;
+                drinkAt = DateTime.MaxValue;
+                barSince = DateTime.Now;
+                playerLeftBarAt = DateTime.MinValue;
+                kit.Task.ClearTasks(false);
+                TASK._TASK_USE_NEAREST_SCENARIO_TO_COORD(kit.Handle, player.Position + player.RightVector * 1.2f, 4f, -1, true, false, false, false);
+                currentAction = "idle";
+                AddEvent("the player stepped up to the bar, and the companion joined them");
+                Log("at the bar");
+                return;
+            }
+            if (!leaning)
+            {
+                if (playerLeftBarAt == DateTime.MinValue) playerLeftBarAt = DateTime.Now;
+                else if ((DateTime.Now - playerLeftBarAt).TotalSeconds > 3)
+                {
+                    atBar = false;
+                    DropBottle();
+                    kit.Task.ClearTasks(false);
+                    ApplyAction("follow");
+                }
+                return;
+            }
+            playerLeftBarAt = DateTime.MinValue;
+            UpdateHand();
+            if (!barSettled && (DateTime.Now - barSince).TotalSeconds > 8)
+            {
+                barSettled = true;
+                if (PED.IS_PED_USING_ANY_SCENARIO(kit.Handle))
+                {
+                    Log("bar: he took a spot beside the player");
+                    handCheckAt = DateTime.Now.AddSeconds(3);
+                    return;
+                }
+                // No free spot nearby: stand at the player's elbow, facing the same way, and drink there.
+                Log("bar: no free spot nearby, standing beside the player");
+                Vector3 elbow = player.Position + player.RightVector * 0.9f;
+                TASK.TASK_GO_STRAIGHT_TO_COORD(kit.Handle, elbow, 1f, 5000, player.Heading, 0.3f, 0);
+                drinkTry = 0;
+                drinkAt = DateTime.Now.AddSeconds(4);
+                return;
+            }
+            // Try each drinking scenario until one takes; not every one plays everywhere.
+            if (DateTime.Now < drinkAt) return;
+            if (drinkTry > 0 && PED.IS_PED_USING_ANY_SCENARIO(kit.Handle))
+            {
+                Log("bar: drinking (" + DrinkScenarios[drinkTry - 1] + ")");
+                drinkAt = DateTime.MaxValue;
+                handCheckAt = DateTime.Now.AddSeconds(2);
+            }
+            else if (drinkTry < DrinkScenarios.Length)
+            {
+                TASK.TASK_START_SCENARIO_IN_PLACE_HASH(kit.Handle, (uint)Game.Joaat(DrinkScenarios[drinkTry]), -1, true, 0, player.Heading, false);
+                drinkTry++;
+                drinkAt = DateTime.Now.AddSeconds(2.5);
+            }
+            else
+            {
+                Log("bar: none of the drinking scenarios played");
+                drinkAt = DateTime.MaxValue;
+                RequestBottle();
+            }
+        }
+
+        static readonly string[] DrinkScenarios = { "WORLD_HUMAN_DRINKING", "WORLD_HUMAN_DRINK_FLASK", "WORLD_HUMAN_DRINK_CHAMPAGNE" };
+        int drinkTry;
+        DateTime drinkAt = DateTime.MaxValue;
+
+        // A drink always comes with something to drink from. Scenarios usually bring their own
+        // bottle or glass; when he's empty-handed anyway, the mod puts a bottle in his right hand.
+        static readonly string[] BottleModels = { "p_bottlebeer01a", "p_bottlebeer01x", "p_bottlewhiskey01x", "p_bottlejd01x", "p_glass001x" };
+        DateTime handCheckAt = DateTime.MaxValue, bottleRequested = DateTime.MaxValue;
+        uint bottleModel;
+        int bottle;
+
+        void UpdateHand()
+        {
+            if (DateTime.Now >= handCheckAt)
+            {
+                handCheckAt = DateTime.MaxValue;
+                bool holding = World.GetAllObjects().Any(o => o != null && o.Exists()
+                    && o.Position.DistanceTo(kit.Position) < 2f && ENTITY.IS_ENTITY_ATTACHED_TO_ENTITY(o.Handle, kit.Handle));
+                Log(holding ? "bar: he has a drink in hand" : "bar: empty-handed, giving him a bottle");
+                if (!holding) RequestBottle();
+            }
+            if (bottleRequested == DateTime.MaxValue) return;
+            if (STREAMING.HAS_MODEL_LOADED(bottleModel))
+            {
+                bottleRequested = DateTime.MaxValue;
+                AttachBottle();
+            }
+            else if ((DateTime.Now - bottleRequested).TotalSeconds > 5)
+            {
+                bottleRequested = DateTime.MaxValue;
+                Log("bar: the bottle model didn't load");
+            }
+        }
+
+        void RequestBottle()
+        {
+            if (bottle != 0) return;
+            string name = BottleModels.FirstOrDefault(m => STREAMING.IS_MODEL_VALID((uint)Game.Joaat(m)));
+            if (name == null) { Log("bar: none of the bottle models exist"); return; }
+            bottleModel = (uint)Game.Joaat(name);
+            STREAMING.REQUEST_MODEL(bottleModel, false);
+            bottleRequested = DateTime.Now;
+            Log("bar: bottle is " + name);
+        }
+
+        void AttachBottle()
+        {
+            bottle = OBJECT.CREATE_OBJECT(bottleModel, kit.Position, false, false, false, false, false);
+            STREAMING.SET_MODEL_AS_NO_LONGER_NEEDED(bottleModel);
+            if (bottle == 0) { Log("bar: couldn't create the bottle"); return; }
+            int hand = ENTITY.GET_ENTITY_BONE_INDEX_BY_NAME(kit.Handle, "SKEL_R_Hand");
+            // Neck up, resting in the palm.
+            ENTITY.ATTACH_ENTITY_TO_ENTITY(bottle, kit.Handle, hand, new Vector3(0.08f, 0.02f, -0.04f), new Vector3(-75f, 0f, 0f),
+                false, false, false, false, 2, true, false, false);
+        }
+
+        void DropBottle()
+        {
+            handCheckAt = bottleRequested = DateTime.MaxValue;
+            if (bottle == 0) return;
+            int h = bottle;
+            bottle = 0;
+            if (ENTITY.DOES_ENTITY_EXIST(h)) unsafe { OBJECT.DELETE_OBJECT(&h); }
+        }
+
         // Sitting at a camp is a scenario, not always a seat, so either counts.
         static bool PlayerSitting(Ped player)
             => !player.IsOnMount && (player.IsSitting || PED.IS_PED_USING_ANY_SCENARIO(player.Handle));
@@ -311,6 +524,26 @@ namespace KitCompanion
                 + $"closest fire={(found ? fire.DistanceTo(player.Position).ToString("0.0") + " m" : "none")} "
                 + $"fires within {FireRangeMeters} m={FIRE.GET_NUMBER_OF_FIRES_IN_RANGE(player.Position, FireRangeMeters)} "
                 + $"interior={INTERIOR.GET_INTERIOR_FROM_ENTITY(player.Handle)}");
+        }
+
+        // The game keeps the player's drunkenness in its own scripts, so the ped value can stay 0.
+        // The drunk screen effect and the drunk flag are the other signs; take the strongest.
+        static readonly string[] DrunkEffects = { "PlayerDrunk01", "PlayerDrunkSaloon1", "PlayerDrunkAberdeen" };
+        DateTime lastDrunkLog = DateTime.MinValue;
+
+        float PlayerDrunkness(Ped player)
+        {
+            float level = PED._GET_PED_DRUNKNESS(player.Handle);
+            bool flag = player.IsDrunk || PED._IS_PED_DRUNK(player.Handle);
+            string effect = DrunkEffects.FirstOrDefault(fx => GRAPHICS.ANIMPOSTFX_IS_RUNNING(fx));
+            if (flag) level = Math.Max(level, 0.5f);
+            if (effect != null) level = Math.Max(level, 0.6f);
+            if (atBar && (DateTime.Now - lastDrunkLog).TotalSeconds > 20)
+            {
+                lastDrunkLog = DateTime.Now;
+                Log($"drunk check: ped={PED._GET_PED_DRUNKNESS(player.Handle):0.00} flag={flag} effect={effect ?? "none"}");
+            }
+            return level;
         }
 
         static string DrunkBracket(float d) => d <= 0.1f ? "sober" : d < 0.4f ? "tipsy" : d < 0.75f ? "drunk" : "hammered";

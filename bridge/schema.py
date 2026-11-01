@@ -26,7 +26,7 @@ DECISION_SCHEMA = {
     "properties": {
         "reason": {
             "type": "string",
-            "description": "One short sentence, Kit's private reason. Never shown in game.",
+            "description": "One short sentence, the companion's private reason. Never shown in game.",
         },
         "action": {"type": "string", "enum": ACTIONS},
         "target": {
@@ -46,7 +46,7 @@ DECISION_SCHEMA = {
         },
         "reveals_truth": {
             "type": "boolean",
-            "description": "True only on the one turn Kit tells Dave he is from 2015.",
+            "description": "True only on the one turn the companion tells the player he is from 2015.",
         },
     },
     "required": [

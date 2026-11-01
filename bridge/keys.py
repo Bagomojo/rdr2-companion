@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 ENV_FILE = Path(__file__).parent / ".env"
+VAULT_TIMEOUT_S = 60  # each lookup normally takes about 20 s
 
 
 def load_env() -> None:
@@ -40,14 +41,22 @@ def secret(env_name: str, vault_item_env: str, default_item: str) -> str:
     if not script:
         return ""
     item = os.environ.get(vault_item_env, default_item)
-    result = subprocess.run(
+    proc = subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
          "-Item", item, "-Field", "password"],
-        capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    key = result.stdout.strip()
-    if result.returncode != 0 or not key:
-        raise RuntimeError(f"Could not read '{item}' with {script} (exit {result.returncode}).")
+    try:
+        out, _ = proc.communicate(timeout=VAULT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # A locked vault can sit at a password prompt nobody sees. Killing only PowerShell
+        # leaves its children holding the pipe open, so take down the whole tree.
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        raise RuntimeError(f"Reading '{item}' with {script} took over {VAULT_TIMEOUT_S} s. "
+                           "Is the password manager locked?") from None
+    key = out.strip()
+    if proc.returncode != 0 or not key:
+        raise RuntimeError(f"Could not read '{item}' with {script} (exit {proc.returncode}).")
     return key
 
 

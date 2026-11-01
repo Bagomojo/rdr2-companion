@@ -1,4 +1,4 @@
-"""Picks the model for each turn: Haiku by default, Opus for Kit's big moments.
+"""Picks the model for each turn: Haiku by default, Opus for the companion's big moments.
 
 Fights and anything with hostiles nearby always go to Haiku, because speed matters
 more there than prose. Calm, character-heavy moments go to Opus.

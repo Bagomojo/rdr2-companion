@@ -210,7 +210,7 @@ SCENES = [
         ),
     },
     {
-        "name": "12 Kit badly hurt under fire",
+        "name": "12 Kip badly hurt under fire",
         "expect": "flee or stay_out; short pained line",
         "state": _state(respect=40),
         "snapshot": _snap(
@@ -218,7 +218,7 @@ SCENES = [
             player={"mounted": False, "weapon_drawn": True},
             companion={"health": "critical", "mounted": False, "distance_m": 15},
             nearby=[{"id": "o1", "kind": "outlaw", "hostile": True, "distance_m": 30}, {"id": "o2", "kind": "outlaw", "hostile": True, "distance_m": 35}],
-            recent_events=["shootout at a cabin", "Kit was shot twice"],
+            recent_events=["shootout at a cabin", "Kip was shot twice"],
         ),
     },
     {
@@ -320,7 +320,7 @@ SCENES = [
             world={"time": "19:30", "region": "Cumberland Forest"},
             player={"mounted": False, "weapon_drawn": False, "honor": "low"},
             companion={"mounted": False, "distance_m": 5, "current_action": "idle"},
-            recent_events=["player walked into Kit's camp unarmed", "player sat down by the fire"],
+            recent_events=["player walked into Kip's camp unarmed", "player sat down by the fire"],
         ),
     },
 ]
