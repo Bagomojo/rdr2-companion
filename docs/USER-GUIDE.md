@@ -22,7 +22,7 @@ playing with him, then covers everything you can change. To see him in action fi
 11. [Settings reference](#11-settings-reference)
 12. [Cost and models](#12-cost-and-models)
 13. [Troubleshooting](#13-troubleshooting)
-14. [Upgrading from v0.1](#14-upgrading-from-v01)
+14. [Upgrading](#14-upgrading)
 15. [Uninstalling](#15-uninstalling)
 
 ## 1. What you need
@@ -41,7 +41,7 @@ playing with him, then covers everything you can change. To see him in action fi
 - **Optional: an ElevenLabs account and API key** from [elevenlabs.io](https://elevenlabs.io) to
   hear him talk. Every line he speaks uses your ElevenLabs plan's character credits, and a cloned
   voice needs a paid plan. Without it, his lines appear as subtitles only.
-- **The release zip** of this mod, `rdr2-companion-v0.2.zip`, from the GitHub Releases page.
+- **The release zip** of this mod, `rdr2-companion-v0.2.1.zip`, from the GitHub Releases page.
 
 Throughout this guide, **the game folder** is the folder that holds `RDR2.exe`. On Steam that's
 usually `C:\Program Files (x86)\Steam\steamapps\common\Red Dead Redemption 2`. In Steam you can
@@ -60,7 +60,7 @@ When Rockstar updates the game, ScriptHook can stop working until Alexander Blad
 matching version. If the game crashes at start after an update, check dev-c.com for a new one.
 
 ## 3. Install the mod
-1. Unzip `rdr2-companion-v0.2.zip` somewhere handy, like your Downloads folder.
+1. Unzip `rdr2-companion-v0.2.1.zip` somewhere handy, like your Downloads folder.
 2. Open its `scripts` folder and copy everything in it into the game's `scripts` folder:
    - `DaveCompanion.dll`: the mod itself.
    - `DaveCompanion.ini`: keys and settings.
@@ -69,7 +69,9 @@ matching version. If the game crashes at start after an update, check dev-c.com 
 ## 4. Set up the bridge
 The bridge is a small program that runs on your PC while you play. The mod sends it what's
 happening in the game, and it asks Claude what Dave says and does. It only listens on your own
-PC (127.0.0.1), so nothing else on your network or the internet can reach it.
+PC (127.0.0.1), so nothing else on your network or the internet can reach it. Each time it starts
+it makes a new secret that only the mod is given, so other programs on your PC can't use it
+either. (Update the mod and the bridge together: a mismatched pair won't talk to each other.)
 
 1. Install Python from python.org. On the first screen of the installer, tick
    **Add python.exe to PATH**.
@@ -309,10 +311,19 @@ open a [new issue](https://github.com/Bagomojo/rdr2-companion/issues/new/choose)
 happened, and drag the zip in. If it can't find your game, run it from a Command Prompt with the
 game folder after it: `collect-logs.cmd "D:\Games\Red Dead Redemption 2"`.
 
-## 14. Upgrading from v0.1
+## 14. Upgrading
+### From v0.2
+1. Copy the new `DaveCompanion.dll` into the game's `scripts` folder. Keep your own
+   `DaveCompanion.ini` and `looks` folder.
+2. Copy the new files from the zip's `bridge` folder over yours (your `.env`, `state` and `logs`
+   folders aren't in the zip, so they're kept), then run `setup.cmd` again.
+
+Update both: the v0.2.1 mod and bridge won't talk to an older copy of the other.
+
+### From v0.1
 In v0.1 the mod was called KitCompanion.
 1. Delete `KitCompanion.dll` from the game's `scripts` folder (if both are there, both run).
-2. Copy in the new `scripts` files from the v0.2 zip.
+2. Copy in the new `scripts` files from the new zip.
 3. Replace your `bridge` folder with the new one, keeping your `.env`, `state` and `logs`
    folders, so his memory and your keys carry over. Run `setup.cmd` again.
 

@@ -8,8 +8,11 @@ Usage: .venv\\Scripts\\python.exe server.py [mix|haiku|opus]   (default: mix)
 
 import json
 import os
+import hmac
 import random
 import re
+import secrets
+import socket
 import sys
 import threading
 import time
@@ -53,6 +56,11 @@ from decide import FALLBACK_ACTION, decide
 from voice import Voice
 
 HOST, PORT = "127.0.0.1", 7777
+MAX_BODY = 64 * 1024  # a snapshot is a few KB
+# A fresh secret each run, in a folder only this Windows user can read. The mod sends it back with
+# every request, so other programs (or other users on this PC) can't spend your credit through us.
+TOKEN = secrets.token_hex(16)
+TOKEN_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "DaveCompanion" / "bridge-token"
 HERE = Path(__file__).parent
 STATE_FILE = HERE / "state" / f"{personas.NAME}.json"
 LOG_DIR = HERE / "logs"
@@ -185,6 +193,43 @@ def log(entry: dict) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+def check_snapshot(snapshot) -> dict:
+    """The fields the bridge itself reads must have the right types; the rest only goes to Claude."""
+    if not isinstance(snapshot, dict):
+        raise TypeError("not an object")
+    for name in ("event", "profile"):
+        if not isinstance(snapshot.get(name, ""), str):
+            raise TypeError(f"{name} isn't text")
+    for name in ("recent_lines", "recent_events"):
+        value = snapshot.get(name, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise TypeError(f"{name} isn't a list of text")
+    companion = snapshot.get("companion", {})
+    if not isinstance(companion, dict) or isinstance(companion.get("distance_m", 0), bool) \
+            or not isinstance(companion.get("distance_m", 0), (int, float)):
+        raise TypeError("companion.distance_m isn't a number")
+    return snapshot
+
+
+class Server(ThreadingHTTPServer):
+    """Windows lets a second socket share a port when SO_REUSEADDR is set, as http.server does.
+    Bind exclusively instead, so a second bridge (or anything else) can't sit on 7777 beside us."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def write_token() -> None:
+    # Microsoft Store Python quietly redirects AppData writes into its own package folder, where the
+    # mod can't see them, so there's a copy in state\ too (the mod reads it when Bridge= is set).
+    for path in (TOKEN_FILE, HERE / "state" / "bridge-token"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(TOKEN, encoding="ascii")
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/decide":
@@ -195,9 +240,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Origin") or not (self.headers.get("Content-Type") or "").startswith("application/json"):
             self.send_error(403)
             return
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        # Any other program on this PC could still reach us, so the mod also proves who it is.
+        if not hmac.compare_digest(self.headers.get("X-Bridge-Token") or "", TOKEN):
+            self.send_error(403, "wrong or missing bridge token")
+            return
+        length = self.headers.get("Content-Length") or ""
+        if not length.isdigit() or int(length) > MAX_BODY:
+            self.send_error(413 if length.isdigit() else 411)
+            return
+        try:
+            snapshot = check_snapshot(json.loads(self.rfile.read(int(length)))["snapshot"])
+        except (ValueError, KeyError, TypeError) as e:
+            self.send_error(400, f"bad snapshot: {e}")
+            return
         state = load_state()
-        snapshot = body["snapshot"]
         global last_comment_at
         global greeted
         global warned_profile
@@ -299,6 +355,13 @@ if __name__ == "__main__":
     if os.environ.get("RDR2_GAME_PID", "").isdigit():
         threading.Thread(target=quit_with_game, args=(int(os.environ["RDR2_GAME_PID"]),), daemon=True).start()
     try:
+        # First, so a second bridge stops here, before it spends credit or replaces the token.
+        server = Server((HOST, PORT), Handler)
+    except OSError:
+        print(f"Port {PORT} is already in use: is another bridge running? This one is stopping.", flush=True)
+        sys.exit(1)
+    write_token()
+    try:
         n = memory.catch_up(client, load_state, save_state, include_open=True)
         if n:
             print(f"Caught up memory from {n} earlier session(s).", flush=True)
@@ -306,4 +369,4 @@ if __name__ == "__main__":
         print(f"Memory catch-up failed, will retry later: {e}", flush=True)
     threading.Thread(target=recap_when_quiet, daemon=True).start()
     print(f"Ready. {personas.current()['name']} on http://{HOST}:{PORT} using {MODEL}", flush=True)
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    server.serve_forever()

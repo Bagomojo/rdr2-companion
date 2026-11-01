@@ -102,8 +102,12 @@ Each companion keeps his own memory (`bridge\state\wade.json`) and his own look
 with a default look until you make one. If you start the bridge by hand instead of with `Bridge=`,
 set `COMPANION=wade` in `bridge\.env` too, and restart the bridge whenever you switch.
 
-## Upgrading from v0.1
-The mod was called KitCompanion. Delete `KitCompanion.dll` from the game's `scripts` folder
+## Upgrading
+From v0.2: copy the new `DaveCompanion.dll` into `scripts` and the new `bridge` files over yours
+(your `.env`, `state` and `logs` are kept), then run `setup.cmd` again. Update both: the v0.2.1
+mod and bridge won't talk to an older copy of the other.
+
+From v0.1: the mod was called KitCompanion. Delete `KitCompanion.dll` from the game's `scripts` folder
 (otherwise both run), then copy in the new files. Your old `KitCompanion.ini` and `KitLook.ini`
 keep working until you replace them with `DaveCompanion.ini` and `looks\dave.ini`.
 

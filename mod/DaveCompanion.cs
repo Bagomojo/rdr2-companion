@@ -12,6 +12,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -702,8 +703,15 @@ namespace DaveCompanion
             {
                 try
                 {
-                    var resp = await Http.PostAsync(BridgeUrl, new StringContent(body, Encoding.UTF8, "application/json"));
+                    var req = new HttpRequestMessage(HttpMethod.Post, BridgeUrl)
+                    {
+                        Content = new StringContent(body, Encoding.UTF8, "application/json"),
+                    };
+                    req.Headers.Add("X-Bridge-Token", BridgeToken());
+                    var resp = await Http.SendAsync(req);
                     string text = await resp.Content.ReadAsStringAsync();
+                    if (!resp.IsSuccessStatusCode)
+                        throw new Exception($"bridge said {(int)resp.StatusCode} {resp.ReasonPhrase}");
                     decisions.Enqueue(json.Deserialize<Dictionary<string, object>>(text));
                     if (evt == retryEvent) { Log("bridge: up, " + evt + " delivered"); retryEvent = null; }
                 }
@@ -845,7 +853,10 @@ namespace DaveCompanion
                     }
                     if (parts.Length == 2 && parts[0].Trim().Equals("Companion", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (parts[1].Trim().Length > 0) companionId = parts[1].Trim().ToLowerInvariant();
+                        // It names a folder and a file, so only letters, digits, - and _ (no ..\).
+                        string id = parts[1].Trim().ToLowerInvariant();
+                        if (Regex.IsMatch(id, "^[a-z0-9_-]{1,40}$")) companionId = id;
+                        else if (id.Length > 0) Log("ini: Companion=" + id + " isn't a folder name; using " + companionId);
                         continue;
                     }
                     if (parts.Length == 2 && parts[0].Trim().Equals("Bridge", StringComparison.OrdinalIgnoreCase))
@@ -917,7 +928,7 @@ namespace DaveCompanion
             {
                 string logs = Path.Combine(bridgeDir, "logs");
                 Directory.CreateDirectory(logs);
-                var info = new ProcessStartInfo("cmd.exe", $"/c \"\"{cmd}\" > \"{Path.Combine(logs, "console.txt")}\" 2>&1\"")
+                var info = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), $"/c \"\"{cmd}\" > \"{Path.Combine(logs, "console.txt")}\" 2>&1\"")
                 {
                     UseShellExecute = false,
                     CreateNoWindow = true,
@@ -929,6 +940,23 @@ namespace DaveCompanion
                 Log("bridge: started");
             }
             catch (Exception ex) { Log("bridge: couldn't start: " + ex.Message); }
+        }
+
+        // The bridge writes a new secret here each time it starts; requests without it are refused.
+        static readonly string TokenFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DaveCompanion", "bridge-token");
+
+        // The bridge also keeps a copy in its state folder; whichever was written last is the live one.
+        string BridgeToken()
+        {
+            try
+            {
+                string own = bridgeDir.Length > 0 ? Path.Combine(bridgeDir, "state", "bridge-token") : "";
+                string newest = new[] { TokenFile, own }.Where(p => p.Length > 0 && File.Exists(p))
+                    .OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
+                return newest == null ? "" : File.ReadAllText(newest).Trim();
+            }
+            catch { return ""; }
         }
 
         void Log(string msg)

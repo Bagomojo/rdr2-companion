@@ -7,7 +7,7 @@
     <RootNamespace>DaveCompanion</RootNamespace>
     <LangVersion>latest</LangVersion>
     <!-- Keep in step with bridge/version.py. -->
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <!-- Where RDR2 lives; override with -p:RDR2Dir=... for another install. -->
     <RDR2Dir Condition="'$(RDR2Dir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Red Dead Redemption 2</RDR2Dir>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

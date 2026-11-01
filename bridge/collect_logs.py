@@ -20,21 +20,48 @@ LOGS = HERE / "logs"
 TURNS = 50          # the last this many turns of the bridge's own log
 MOD_LINES = 600     # the last this many lines of the mod's log
 
+# No word boundaries: a key can come straight after other text, as in an error message's "\nsk_...".
 SECRETS = [
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),       # Anthropic
-    re.compile(r"\bsk_[0-9a-f]{20,}\b"),            # ElevenLabs
-    re.compile(r"\b[0-9a-f]{32}\b"),                # older ElevenLabs keys
+    re.compile(r"sk_[0-9a-f]{20,}"),                # ElevenLabs
+    re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])"),  # older ElevenLabs keys
 ]
 SECRET_SETTING = re.compile(r"^\s*([A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)\s*=.*$", re.M | re.I)
 
 
+def env_secrets() -> list[str]:
+    """The values of the key settings in .env, to take out wherever they turn up, whatever their shape."""
+    env = HERE / ".env"
+    if not env.exists():
+        return []
+    values = []
+    for line in env.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = SECRET_SETTING.match(line)
+        if m:
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if len(value) >= 8:
+                values.append(value)
+    return values
+
+
+def short_path(path: str) -> str:
+    """The 8.3 form of a path (C:\\Users\\DAVECH~1), which shows up in some temp paths."""
+    import ctypes
+    buf = ctypes.create_unicode_buffer(260)
+    return buf.value if ctypes.windll.kernel32.GetShortPathNameW(path, buf, 260) else path
+
+
 def scrub(text: str) -> str:
+    for value in env_secrets():
+        text = text.replace(value, "[key removed]")
     for pattern in SECRETS:
         text = pattern.sub("[key removed]", text)
     text = SECRET_SETTING.sub(r"\1=[removed]", text)
     home = os.path.expanduser("~")
+    for form in {home, short_path(home)}:
+        text = re.sub(re.escape(form), "%USERPROFILE%", text, flags=re.I)
+        text = re.sub(re.escape(form.replace("\\", "/")), "%USERPROFILE%", text, flags=re.I)
     user = os.environ.get("USERNAME", "")
-    text = text.replace(home, "%USERPROFILE%").replace(home.replace("\\", "/"), "%USERPROFILE%")
     if len(user) > 2:
         text = re.sub(re.escape(user), "<user>", text, flags=re.I)
     return text
@@ -109,7 +136,10 @@ def main() -> None:
             ("ScriptHookRDR2.dll", "dinput8.dll", "ScriptHookRDRDotNet.asi", "ScriptHookRDRNetAPI.dll")
             if (game / n).exists()) or "In the game folder: no ScriptHook files found")
         if scripts.exists():
-            info.append("In scripts: " + ", ".join(sorted(p.name for p in scripts.iterdir())))
+            # Only the mod's own files: the rest of the folder would list your other mods.
+            info.append("In scripts: " + (", ".join(
+                n for n in ("DaveCompanion.dll", "DaveCompanion.ini", "KitCompanion.dll", "KitCompanion.ini", "looks")
+                if (scripts / n).exists()) or "none of the mod's files"))
             for name in ("DaveCompanion.log", "KitCompanion.log"):
                 if (scripts / name).exists():
                     files[name] = tail(scripts / name, MOD_LINES)
